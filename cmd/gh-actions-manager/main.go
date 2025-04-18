@@ -1,14 +1,16 @@
+// Package main is used for the gh-actions-manager daemon.
 package main
 
 import (
-	"fmt"
-	"io/ioutil"
+	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
+// Config represents the Github Actions Manager configuration.
 type Config struct {
 	Defaults struct {
 		Architecture string `yaml:"architecture"`
@@ -33,7 +35,7 @@ type Config struct {
 		Server struct {
 			URL         string `yaml:"url"`
 			Certificate string `yaml:"certificate"`
-		}
+		} `yaml:"server"`
 	} `yaml:"incus"`
 
 	Github struct {
@@ -53,33 +55,43 @@ var config *Config
 
 func main() {
 	// Load the configuration.
-	data, err := ioutil.ReadFile(os.Args[1])
+	data, err := os.ReadFile(os.Args[1])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read the configuration: %s\n", err)
+		slog.Error("failed to read the configuration", "err", err)
 		os.Exit(1)
 	}
 
 	err = yaml.Unmarshal(data, &config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to parse the configuration: %s\n", err)
+		slog.Error("failed to parse the configuration", "err", err)
 		os.Exit(1)
 	}
 
 	// Connect to Github.
 	err = ghConnect()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to Github: %s\n", err)
+		slog.Error("failed to connect to Github", "err", err)
 		os.Exit(1)
 	}
 
 	// Login to LXD.
 	err = incusConnect()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to Incus: %s\n", err)
+		slog.Error("failed to connect to Incus", "err", err)
 		os.Exit(1)
 	}
 
 	// Start the web server.
 	http.HandleFunc("/", ghHandle)
-	http.ListenAndServe(config.Daemon.Listen, nil)
+
+	server := &http.Server{
+		Addr:              config.Daemon.Listen,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+
+	err = server.ListenAndServe()
+	if err != nil {
+		slog.Error("failed start server", "err", err)
+		os.Exit(1)
+	}
 }

@@ -2,17 +2,21 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
 
-	"github.com/lxc/incus/v6/client"
+	incus "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
 	"github.com/lxc/incus/v6/shared/revert"
 )
 
-var incusClient incus.InstanceServer
-var incusMu sync.Mutex
+var (
+	incusClient incus.InstanceServer
+	incusMu     sync.Mutex
+)
 
 func incusConnect() error {
 	// Setup connection arguments.
@@ -23,13 +27,14 @@ func incusConnect() error {
 	}
 
 	// Connect to the server.
-	client, err := incus.ConnectIncus(config.Incus.Server.URL, args)
+	c, err := incus.ConnectIncus(config.Incus.Server.URL, args)
 	if err != nil {
 		return err
 	}
 
 	// Set the client.
-	incusClient = client.UseProject(config.Incus.Project)
+	incusClient = c.UseProject(config.Incus.Project)
+
 	return nil
 }
 
@@ -58,15 +63,18 @@ runcmd:
 func incusUserData(arch string, labels []string, repo string, token string) string {
 	// Render the cloud-init data.
 	var agentArch string
-	if arch == "amd64" {
+	switch arch {
+	case "amd64":
 		agentArch = "x64"
-	} else if arch == "arm64" {
+	case "arm64":
 		agentArch = "arm64"
-	} else {
+	default:
+		slog.Error("Unsupported architecture", "arch", arch)
+
 		return ""
 	}
 
-	var sb *strings.Builder = &strings.Builder{}
+	sb := &strings.Builder{}
 	err := incusCloudInitTpl.Execute(sb, map[string]any{
 		"agentVersion": config.Github.Agent.Version,
 		"agentArch":    agentArch,
@@ -97,7 +105,7 @@ func incusSpawnInstance(name string, labels []string, os string, arch string, cp
 		},
 		InstancePut: api.InstancePut{
 			Config: map[string]string{
-				"limits.cpu":           fmt.Sprintf("%d", cpu),
+				"limits.cpu":           strconv.Itoa(cpu),
 				"limits.memory":        memory,
 				"cloud-init.user-data": incusUserData(arch, labels, repo, token),
 			},
@@ -110,16 +118,18 @@ func incusSpawnInstance(name string, labels []string, os string, arch string, cp
 	op, err := incusClient.CreateInstance(req)
 	if err != nil {
 		incusMu.Unlock()
+
 		return err
 	}
 
 	reverter.Add(func() {
-		incusClient.DeleteInstance(req.Name)
+		_, _ = incusClient.DeleteInstance(req.Name)
 	})
 
 	err = op.Wait()
 	if err != nil {
 		incusMu.Unlock()
+
 		return err
 	}
 	incusMu.Unlock()
@@ -154,14 +164,17 @@ func incusSpawnInstance(name string, labels []string, os string, arch string, cp
 	op, err = incusClient.UpdateInstanceState(name, reqState, "")
 	if err != nil {
 		incusMu.Unlock()
+
 		return err
 	}
 
 	err = op.Wait()
 	if err != nil {
 		incusMu.Unlock()
+
 		return err
 	}
+
 	incusMu.Unlock()
 
 	// We're done.

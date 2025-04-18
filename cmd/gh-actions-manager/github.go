@@ -6,10 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"net/http"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ type ghWebhook struct {
 
 func ghConnect() error {
 	ghClient = github.NewClient(nil).WithAuthToken(config.Github.Token)
+
 	return nil
 }
 
@@ -46,58 +48,59 @@ func ghValidateSignature(r *http.Request, body []byte) error {
 	// Get the header.
 	signature := strings.SplitN(r.Header.Get("X-Hub-Signature-256"), "=", 2)
 	if signature[0] != "sha256" {
-		return fmt.Errorf("Github signature header not found")
+		return errors.New("github signature header not found")
 	}
 
 	// Compute the hash.
 	hash := hmac.New(sha256.New, []byte(config.Github.Webhook.Key))
 	_, err := hash.Write(body)
 	if err != nil {
-		return fmt.Errorf("Failed to compute the request hash: %w", err)
+		return fmt.Errorf("failed to compute the request hash: %w", err)
 	}
 
 	// Validate the hash.
 	expectedHash := hex.EncodeToString(hash.Sum(nil))
 	if signature[1] != expectedHash {
-		return fmt.Errorf("Signature mismatch: %s vs %s", signature[1], expectedHash)
+		return fmt.Errorf("signature mismatch: %s vs %s", signature[1], expectedHash)
 	}
 
 	return nil
 }
 
 func ghHandle(w http.ResponseWriter, r *http.Request) {
-	err := ghHandleRequest(w, r)
+	err := ghHandleRequest(r.Context(), r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error"))
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		_, _ = w.Write([]byte("500 - Internal Server Error"))
+		slog.Error("Failed to handle request", "err", err)
 	}
 }
 
-func ghHandleRequest(w http.ResponseWriter, r *http.Request) error {
+func ghHandleRequest(ctx context.Context, r *http.Request) error {
 	// Read the request body.
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return fmt.Errorf("Failed to read the request body: %w", err)
+		return fmt.Errorf("failed to read the request body: %w", err)
 	}
 	defer r.Body.Close()
 
 	// Validate that it's from Github.
 	err = ghValidateSignature(r, body)
 	if err != nil {
-		return fmt.Errorf("Failed validation: %w", err)
+		return fmt.Errorf("failed validation: %w", err)
 	}
 
 	// Parse the request.
 	var req *ghWebhook
 	err = json.Unmarshal(body, &req)
 	if err != nil {
-		return fmt.Errorf("Failed to parse body: %w", err)
+		return fmt.Errorf("failed to parse body: %w", err)
 	}
 
 	// Only handle queued items.
 	if req.Action != "queued" {
-		fmt.Printf("UNKNOWN ACTION: %s\n", req.Action)
+		slog.Error("unknown action", "action", req.Action)
+
 		return nil
 	}
 
@@ -107,7 +110,7 @@ func ghHandleRequest(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// Print the request.
-	fmt.Printf("[%s] %s (%s)\n", req.Action, req.Workflow.Name, strings.Join(req.Workflow.Labels, ", "))
+	slog.Info("New request", "action", req.Action, "workflow", req.Workflow.Name, "labels", req.Workflow.Labels)
 
 	// Figure out the instance needed.
 	instCPU := config.Defaults.CPU
@@ -129,48 +132,55 @@ func ghHandleRequest(w http.ResponseWriter, r *http.Request) error {
 			}
 
 			instCPU = value
+
 			continue
 		}
 
 		if fields[0] == "mem" {
 			instMemory = strings.Replace(fields[1], "G", "GiB", 1)
+
 			continue
 		}
 
 		if fields[0] == "disk" {
 			instDisk = strings.Replace(fields[1], "G", "GiB", 1)
+
 			continue
 		}
 
 		if fields[0] == "arch" {
 			instArch = fields[1]
+
 			continue
 		}
 
 		if fields[0] == "image" {
-			instOS = strings.Replace(fields[1], "-", "/", -1)
+			instOS = strings.ReplaceAll(fields[1], "-", "/")
+
 			continue
 		}
 	}
 
 	// Obtain a new token.
-	token, _, err := ghClient.Actions.CreateRegistrationToken(context.Background(), req.Repository.Owner.Login, req.Repository.Name)
+	token, _, err := ghClient.Actions.CreateRegistrationToken(ctx, req.Repository.Owner.Login, req.Repository.Name)
 	if err != nil {
-		return fmt.Errorf("Couldn't register worker: %w", err)
+		return fmt.Errorf("couldn't register worker: %w", err)
 	}
 
 	// Spawn the runner.
-	fmt.Printf("[spawning] %s/%s (CPU=%d RAM=%s DISK=%s) => %s\n", instOS, instArch, instCPU, instMemory, instDisk, req.Workflow.URL)
+	slog.Info("Spawning instance", "os", instOS, "architecture", instArch, "cpu", instCPU, "memory", instMemory, "disk", instDisk, "url", req.Workflow.URL)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		err = incusSpawnInstance(fmt.Sprintf("gh-%s-%s-%d", req.Repository.Owner.Login, req.Repository.Name, req.Workflow.ID), req.Workflow.Labels, instOS, instArch, instCPU, instMemory, instDisk, fmt.Sprintf("%s/%s", req.Repository.Owner.Login, req.Repository.Name), *token.Token)
 		if err == nil {
 			break
 		}
+
 		time.Sleep(5 * time.Second)
 	}
+
 	if err != nil {
-		return fmt.Errorf("Failed to spawn instance: %w", err)
+		return fmt.Errorf("failed to spawn instance: %w", err)
 	}
 
 	return nil
