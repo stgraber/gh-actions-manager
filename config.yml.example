@@ -1,0 +1,26 @@
+defaults:
+  archtecture: amd64
+  cpu: 4
+  memory: 4GiB
+  disk: 50GiB
+  image: ubuntu/24.04
+
+daemon:
+  listen: :8080
+
+incus:
+  client:
+    certificate: |-
+      CLIENT CERTIFICATE
+    key: |-
+      CLIENT KEY
+  project: github
+  server:
+    url: INCUS URL
+
+github:
+  agent:
+    version: 2.307.1
+  token: GITHUB ACCESS TOKEN
+  webhook:
+    key: RANDOM ENCRYPTION KEY/UUID
